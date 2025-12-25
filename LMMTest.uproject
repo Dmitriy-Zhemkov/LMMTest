@@ -32,6 +32,22 @@
 		{
 			"Name": "UAFControlRig",
 			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeCoreML",
+			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeIREE",
+			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeBasicCpu",
+			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeRDG",
+			"Enabled": true
 		}
 	]
 }

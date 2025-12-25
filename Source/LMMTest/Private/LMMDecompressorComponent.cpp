@@ -1,121 +1,569 @@
+Ôªø// LMMDecompressorComponent.cpp
+
 #include "LMMDecompressorComponent.h"
 #include "Misc/FileHelper.h"
-#include "HAL/PlatformFilemanager.h"
+#include "Misc/Paths.h"
+#include "HAL/PlatformProcess.h"
 
-// Include ONNX Runtime headers
-#include <onnxruntime_cxx_api.h>
-
-// For animation and control rig
+// Control Rig
 #include "ControlRig.h"
 #include "ControlRigComponent.h"
-#include "RigVMHost.h"
 #include "Components/SkeletalMeshComponent.h"
-#include "Animation/AnimInstance.h"
+
+// ONNX Runtime - —É—Å–ª–æ–≤–Ω–∞—è –∫–æ–º–ø–∏–ª—è—Ü–∏—è
+#if WITH_ONNX
+#include <onnxruntime_cxx_api.h>
+#endif
+
+// ==================== –ö–û–ù–°–¢–†–£–ö–¢–û–† ====================
 
 ULMMDecompressorComponent::ULMMDecompressorComponent()
 {
     PrimaryComponentTick.bCanEverTick = true;
-    Session = nullptr;
+
+    CurrentFeatures.SetNum(FEATURE_DIM);
+    CurrentLatentZ.SetNum(LATENT_DIM);
+    CurrentPose.SetNum(POSE_DIM);
+
+    for (int32 i = 0; i < FEATURE_DIM; i++) CurrentFeatures[i] = 0.0f;
+    for (int32 i = 0; i < LATENT_DIM; i++) CurrentLatentZ[i] = 0.0f;
+    for (int32 i = 0; i < POSE_DIM; i++) CurrentPose[i] = 0.0f;
+}
+
+// ==================== LIFECYCLE ====================
+
+void ULMMDecompressorComponent::BeginPlay()
+{
+    Super::BeginPlay();
+
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] ========================================"));
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] BeginPlay - LMM Component Starting"));
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] ========================================"));
+
+#if WITH_ONNX
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] ONNX Runtime: ENABLED"));
+#else
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] ONNX Runtime: DISABLED (no ThirdParty/onnxruntime)"));
+#endif
+
+    if (Initialize())
+    {
+        bIsInitialized = true;
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ Initialization SUCCESS!"));
+        ForceProjection();
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] ‚ùå Initialization FAILED!"));
+    }
+}
+
+void ULMMDecompressorComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    CleanupOnnx();
+    Super::EndPlay(EndPlayReason);
+}
+
+// ==================== INITIALIZE ====================
+
+bool ULMMDecompressorComponent::Initialize()
+{
+    FString ProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+    FString DataDir = FPaths::Combine(ProjectDir, DataFolder);
+
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] Project: %s"), *ProjectDir);
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] Data: %s"), *DataDir);
+
+    // –ü—Ä–æ–≤–µ—Ä—è–µ–º –ø–∞–ø–∫—É
+    if (!FPaths::DirectoryExists(DataDir))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Data folder NOT FOUND!"));
+        return false;
+    }
+
+    // –ó–∞–≥—Ä—É–∂–∞–µ–º txt —Ñ–∞–π–ª—ã
+    bool bTxtOk = true;
+    bTxtOk &= LoadTxtToArray(FPaths::Combine(DataDir, TEXT("feature_mean.txt")), FeatureMean);
+    bTxtOk &= LoadTxtToArray(FPaths::Combine(DataDir, TEXT("feature_std.txt")), FeatureStd);
+    bTxtOk &= LoadTxtToArray(FPaths::Combine(DataDir, TEXT("pose_mean.txt")), PoseMean);
+    bTxtOk &= LoadTxtToArray(FPaths::Combine(DataDir, TEXT("pose_std.txt")), PoseStd);
+
+    if (!bTxtOk)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Failed to load normalization files!"));
+        return false;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ Normalization: feat=%d/%d, pose=%d/%d"),
+        FeatureMean.Num(), FeatureStd.Num(), PoseMean.Num(), PoseStd.Num());
+
+    // –ò–Ω–∏—Ü–∏–∞–ª–∏–∑–∏—Ä—É–µ–º ONNX
+#if WITH_ONNX
+    if (!InitOnnxRuntime())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] ONNX init failed - running without inference"));
+        bOnnxLoaded = false;
+    }
+    else
+    {
+        // –ó–∞–≥—Ä—É–∂–∞–µ–º –º–æ–¥–µ–ª–∏
+        FString ProjectorPath = FPaths::Combine(DataDir, TEXT("projector.onnx"));
+        FString StepperPath = FPaths::Combine(DataDir, TEXT("stepper.onnx"));
+        FString DecompressorPath = FPaths::Combine(DataDir, TEXT("decompressor.onnx"));
+
+        bool bModelsOk = true;
+        bModelsOk &= LoadModel(ProjectorPath, ProjectorSession);
+        bModelsOk &= LoadModel(StepperPath, StepperSession);
+        bModelsOk &= LoadModel(DecompressorPath, DecompressorSession);
+
+        if (bModelsOk)
+        {
+            bOnnxLoaded = true;
+            UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ All ONNX models loaded!"));
+        }
+        else
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[LMM] Some models failed to load"));
+            bOnnxLoaded = false;
+        }
+    }
+#else
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] Running without ONNX (test mode)"));
+    bOnnxLoaded = false;
+#endif
+
+    return true; // –í–æ–∑–≤—Ä–∞—â–∞–µ–º true –¥–∞–∂–µ –±–µ–∑ ONNX - –∫–æ–º–ø–æ–Ω–µ–Ω—Ç —Ä–∞–±–æ—Ç–∞–µ—Ç
+}
+
+bool ULMMDecompressorComponent::InitOnnxRuntime()
+{
+#if WITH_ONNX
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] Initializing ONNX Runtime..."));
+
+    // –®–ê–ì 1: –í—Ä—É—á–Ω—É—é –∑–∞–≥—Ä—É–∂–∞–µ–º DLL
+    FString ProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+    FString DllPath = FPaths::Combine(ProjectDir, TEXT("Source/ThirdParty/onnxruntime/lib/onnxruntime.dll"));
+
+    // –¢–∞–∫–∂–µ –ø—Ä–æ–±—É–µ–º shared providers
+    FString SharedDllPath = FPaths::Combine(ProjectDir, TEXT("Source/ThirdParty/onnxruntime/lib/onnxruntime_providers_shared.dll"));
+
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] Loading DLL: %s"), *DllPath);
+
+    if (FPaths::FileExists(SharedDllPath))
+    {
+        void* SharedHandle = FPlatformProcess::GetDllHandle(*SharedDllPath);
+        if (SharedHandle)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ Loaded providers_shared.dll"));
+        }
+    }
+
+    if (!FPaths::FileExists(DllPath))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] DLL not found: %s"), *DllPath);
+        return false;
+    }
+
+    void* DllHandle = FPlatformProcess::GetDllHandle(*DllPath);
+    if (!DllHandle)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Failed to load DLL!"));
+        return false;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ DLL loaded successfully!"));
+
+    // –®–ê–ì 2: –¢–µ–ø–µ—Ä—å —Å–æ–∑–¥–∞—ë–º ONNX –æ–±—ä–µ–∫—Ç—ã
+    try
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] Creating Ort::Env..."));
+
+        // –°–æ–∑–¥–∞—ë–º Environment
+        Ort::Env* Env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "LMM");
+        OrtEnv = Env;
+
+        // –°–æ–∑–¥–∞—ë–º SessionOptions
+        Ort::SessionOptions* Options = new Ort::SessionOptions();
+        Options->SetIntraOpNumThreads(1);
+        Options->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+        OrtSessionOptions = Options;
+
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ ONNX Runtime initialized!"));
+        return true;
+    }
+    catch (const Ort::Exception& e)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] ONNX Exception: %s"), ANSI_TO_TCHAR(e.what()));
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Std Exception: %s"), ANSI_TO_TCHAR(e.what()));
+        return false;
+    }
+    catch (...)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Unknown exception!"));
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ULMMDecompressorComponent::LoadModel(const FString& Path, void*& OutSession)
+{
+#if WITH_ONNX
+    if (!FPaths::FileExists(Path))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Model not found: %s"), *Path);
+        return false;
+    }
+
+    if (!OrtEnv || !OrtSessionOptions)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] ONNX not initialized!"));
+        return false;
+    }
+
+    FString AbsPath = FPaths::ConvertRelativePathToFull(Path);
+    UE_LOG(LogTemp, Warning, TEXT("[LMM] Loading: %s"), *FPaths::GetCleanFilename(Path));
+
+    try
+    {
+        Ort::Env* Env = static_cast<Ort::Env*>(OrtEnv);
+        Ort::SessionOptions* Options = static_cast<Ort::SessionOptions*>(OrtSessionOptions);
+
+        std::wstring WPath(*AbsPath);
+        Ort::Session* Session = new Ort::Session(*Env, WPath.c_str(), *Options);
+        OutSession = Session;
+
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] ‚úÖ Loaded: %s"), *FPaths::GetCleanFilename(Path));
+        return true;
+    }
+    catch (const Ort::Exception& e)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] ONNX: %s"), ANSI_TO_TCHAR(e.what()));
+        return false;
+    }
+    catch (...)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LMM] Unknown error loading model"));
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+void ULMMDecompressorComponent::CleanupOnnx()
+{
+#if WITH_ONNX
+    if (ProjectorSession)
+    {
+        delete static_cast<Ort::Session*>(ProjectorSession);
+        ProjectorSession = nullptr;
+    }
+    if (StepperSession)
+    {
+        delete static_cast<Ort::Session*>(StepperSession);
+        StepperSession = nullptr;
+    }
+    if (DecompressorSession)
+    {
+        delete static_cast<Ort::Session*>(DecompressorSession);
+        DecompressorSession = nullptr;
+    }
+    if (OrtSessionOptions)
+    {
+        delete static_cast<Ort::SessionOptions*>(OrtSessionOptions);
+        OrtSessionOptions = nullptr;
+    }
+    if (OrtEnv)
+    {
+        delete static_cast<Ort::Env*>(OrtEnv);
+        OrtEnv = nullptr;
+    }
+#endif
 }
 
 bool ULMMDecompressorComponent::LoadTxtToArray(const FString& FilePath, TArray<float>& OutArray)
 {
-    FString Content;
-    if (!FFileHelper::LoadFileToString(Content, *FilePath)) return false;
-
-    TArray<FString> Values;
-    Content.ParseIntoArray(Values, TEXT(","), true);
-    OutArray.Empty();
-    for (FString& Val : Values)
+    if (!FPaths::FileExists(FilePath))
     {
-        OutArray.Add(FCString::Atof(*Val));
-    }
-    return true;
-}
-
-bool ULMMDecompressorComponent::LoadModel(const FString& OnnxModelPath, const FString& MeanPath, const FString& StdPath)
-{
-    if (!LoadTxtToArray(MeanPath, PoseMean)) return false;
-    if (!LoadTxtToArray(StdPath, PoseStd)) return false;
-
-    static Ort::Env Env(ORT_LOGGING_LEVEL_WARNING, "LMM");
-    Ort::SessionOptions SessionOptions;
-    SessionOptions.SetIntraOpNumThreads(1);
-    Session = new Ort::Session(Env, *OnnxModelPath, SessionOptions);
-    return Session != nullptr;
-}
-
-bool ULMMDecompressorComponent::PredictPose(const TArray<float>& InputFeatures, TArray<float>& OutPose)
-{
-    if (!Session || InputFeatures.Num() != 16) return false;
-
-    Ort::AllocatorWithDefaultOptions Allocator;
-    const int64_t inputShape[] = { 1, 16 };
-    Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-    auto inputTensor = Ort::Value::CreateTensor<float>(memInfo, const_cast<float*>(InputFeatures.GetData()), 16, inputShape, 2);
-
-    const char* inputNames[] = { "features" };
-    const char* outputNames[] = { "pose_normalized" };
-
-    auto outputTensors = ((Ort::Session*)Session)->Run(Ort::RunOptions{ nullptr }, inputNames, &inputTensor, 1, outputNames, 1);
-
-    float* rawOutput = outputTensors[0].GetTensorMutableData<float>();
-    size_t count = outputTensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
-
-    if (PoseMean.Num() < (int32)count || PoseStd.Num() < (int32)count)
-    {
-        UE_LOG(LogTemp, Error, TEXT("PoseMean/PoseStd too small: mean=%d std=%d need=%d"),
-            PoseMean.Num(), PoseStd.Num(), (int32)count);
+        UE_LOG(LogTemp, Error, TEXT("[LMM] File not found: %s"), *FilePath);
         return false;
     }
 
-    OutPose.SetNum(count);
-    for (size_t i = 0; i < count; ++i)
+    FString Content;
+    if (!FFileHelper::LoadFileToString(Content, *FilePath))
     {
-        OutPose[i] = rawOutput[i] * PoseStd[i] + PoseMean[i];  // ‰ÂÌÓÏ‡ÎËÁ‡ˆËˇ
+        return false;
     }
 
-    return true;
+    TArray<FString> Lines;
+    Content.ParseIntoArrayLines(Lines);
+
+    OutArray.Empty();
+    for (const FString& Line : Lines)
+    {
+        FString Trimmed = Line.TrimStartAndEnd();
+        if (!Trimmed.IsEmpty())
+        {
+            OutArray.Add(FCString::Atof(*Trimmed));
+        }
+    }
+
+    return OutArray.Num() > 0;
 }
 
-void ULMMDecompressorComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+// ==================== TICK ====================
+
+void ULMMDecompressorComponent::TickComponent(float DeltaTime, ELevelTick TickType,
+    FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    USkeletalMeshComponent* SkelMesh = GetOwner()->FindComponentByClass<USkeletalMeshComponent>();
-    UControlRigComponent* RigComp = GetOwner()->FindComponentByClass<UControlRigComponent>();
-    if (!SkelMesh || !RigComp)
+    if (!bIsInitialized) return;
+
+    FrameCounter++;
+
+    // –ï—Å–ª–∏ ONNX –Ω–µ –∑–∞–≥—Ä—É–∂–µ–Ω - –ø—Ä–æ—Å—Ç–æ —Ç–∏–∫–∞–µ–º
+    if (!bOnnxLoaded)
     {
+        // –ö–∞–∂–¥—ã–µ 60 –∫–∞–¥—Ä–æ–≤ –≤—ã–≤–æ–¥–∏–º –ª–æ–≥
+        if (FrameCounter % 60 == 0)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[LMM] Tick #%d (no ONNX)"), FrameCounter);
+        }
         return;
     }
 
-    UControlRig* Rig = RigComp->GetControlRig();
-    if (!Rig)
+    // –° ONNX
+    if (FrameCounter >= ProjectionInterval)
     {
-        return;
+        FrameCounter = 0;
+
+        TArray<float> Query = BuildQueryFeatures();
+        TArray<float> NormQuery = NormalizeFeatures(Query);
+
+        TArray<float> NewF, NewZ;
+        if (RunProjector(NormQuery, NewF, NewZ))
+        {
+            CurrentFeatures = NewF;
+            CurrentLatentZ = NewZ;
+        }
+    }
+    else
+    {
+        TArray<float> DF, DZ;
+        if (RunStepper(CurrentFeatures, CurrentLatentZ, DF, DZ))
+        {
+            for (int32 i = 0; i < FEATURE_DIM; i++) CurrentFeatures[i] += DF[i];
+            for (int32 i = 0; i < LATENT_DIM; i++) CurrentLatentZ[i] += DZ[i];
+        }
     }
 
-    // 1) ¬’Œƒ ‚ ÏÓ‰ÂÎ¸ (ÔÓÍ‡ Á‡„ÎÛ¯Í‡: 16 ÙË˜ÂÈ = 0)
-    TArray<float> InputFeatures;
-    InputFeatures.Init(0.0f, 16);
-
-    // 2) ¬€’Œƒ ÏÓ‰ÂÎË = ÔÓÁ‡ (ÚÓ, ˜ÚÓ Ú˚ ıÓ˜Â¯¸ ÔÂÂ‰‡Ú¸ ‚ Control Rig)
-    TArray<float> PoseData;
-    if (!PredictPose(InputFeatures, PoseData))
+    TArray<float> NormPose;
+    if (RunDecompressor(CurrentFeatures, CurrentLatentZ, NormPose))
     {
-        return; // ÌÂÚ ÏÓ‰ÂÎË/ÌÂ Á‡„ÛÊÂÌ˚ mean/std/ÌÂ ÚÂ ‡ÁÏÂ˚
+        CurrentPose = DenormalizePose(NormPose);
+        ApplyPoseToControlRig();
     }
-
-    // 3) ¬ Ú‚ÓËı ÎÓ„‡ı RigVM Û„‡ÎÒˇ Ì‡ TArray<double> (Real), ÔÓ˝ÚÓÏÛ ¯Î∏Ï double
-    TArray<double> PoseReal;
-    PoseReal.Reserve(PoseData.Num());
-    for (float v : PoseData)
-    {
-        PoseReal.Add((double)v);
-    }
-
-    // 4) œÂÂ‰‡∏Ï ‚ ÔÂÂÏÂÌÌÛ˛ Control Rig (Expose to Rig Instance)
-    Rig->SetPublicVariableValue(FName(TEXT("PoseData")), PoseReal);
 }
 
+// ==================== PUBLIC ====================
+
+void ULMMDecompressorComponent::SetDesiredVelocity(FVector Velocity) { DesiredVelocity = Velocity; }
+void ULMMDecompressorComponent::SetDesiredFacing(FVector Direction)
+{
+    DesiredFacing = Direction.GetSafeNormal();
+    if (DesiredFacing.IsNearlyZero()) DesiredFacing = FVector::ForwardVector;
+}
+void ULMMDecompressorComponent::ForceProjection() { FrameCounter = ProjectionInterval; }
+TArray<float> ULMMDecompressorComponent::GetCurrentPose() const { return CurrentPose; }
+
+// ==================== QUERY ====================
+
+TArray<float> ULMMDecompressorComponent::BuildQueryFeatures()
+{
+    TArray<float> Q;
+    Q.SetNum(FEATURE_DIM);
+
+    for (int32 i = 0; i < 8 && i < CurrentFeatures.Num(); i++) Q[i] = CurrentFeatures[i];
+
+    float VX = DesiredVelocity.Y / 100.0f;
+    float VZ = DesiredVelocity.X / 100.0f;
+    Q[8] = VX; Q[9] = VZ;
+
+    float T[] = { 0.66f, 1.33f, 2.0f };
+    for (int32 i = 0; i < 3; i++) { Q[10 + i * 2] = VX * T[i]; Q[11 + i * 2] = VZ * T[i]; }
+    for (int32 i = 0; i < 3; i++) { Q[16 + i * 2] = DesiredFacing.Y; Q[17 + i * 2] = DesiredFacing.X; }
+
+    return Q;
+}
+
+TArray<float> ULMMDecompressorComponent::NormalizeFeatures(const TArray<float>& Raw)
+{
+    TArray<float> N; N.SetNum(FEATURE_DIM);
+    for (int32 i = 0; i < FEATURE_DIM; i++)
+    {
+        float M = (i < FeatureMean.Num()) ? FeatureMean[i] : 0.0f;
+        float S = (i < FeatureStd.Num()) ? FeatureStd[i] : 1.0f;
+        if (FMath::Abs(S) < 1e-8f) S = 1.0f;
+        N[i] = (Raw[i] - M) / S;
+    }
+    return N;
+}
+
+TArray<float> ULMMDecompressorComponent::DenormalizePose(const TArray<float>& Norm)
+{
+    TArray<float> R; R.SetNum(POSE_DIM);
+    for (int32 i = 0; i < POSE_DIM; i++)
+    {
+        float M = (i < PoseMean.Num()) ? PoseMean[i] : 0.0f;
+        float S = (i < PoseStd.Num()) ? PoseStd[i] : 1.0f;
+        R[i] = Norm[i] * S + M;
+    }
+    return R;
+}
+
+// ==================== INFERENCE ====================
+
+bool ULMMDecompressorComponent::RunProjector(const TArray<float>& Query,
+    TArray<float>& OutF, TArray<float>& OutZ)
+{
+#if WITH_ONNX
+    if (!ProjectorSession || Query.Num() != FEATURE_DIM) return false;
+
+    try
+    {
+        Ort::Session* Session = static_cast<Ort::Session*>(ProjectorSession);
+        Ort::MemoryInfo Mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+        std::vector<int64_t> Shape = { 1, FEATURE_DIM };
+        std::vector<float> Data(Query.GetData(), Query.GetData() + Query.Num());
+
+        Ort::Value In = Ort::Value::CreateTensor<float>(Mem, Data.data(), Data.size(), Shape.data(), Shape.size());
+
+        const char* InN[] = { "query" };
+        const char* OutN[] = { "features_z" };
+
+        auto Out = Session->Run(Ort::RunOptions{ nullptr }, InN, &In, 1, OutN, 1);
+        float* D = Out[0].GetTensorMutableData<float>();
+
+        OutF.SetNum(FEATURE_DIM);
+        OutZ.SetNum(LATENT_DIM);
+        for (int32 i = 0; i < FEATURE_DIM; i++) OutF[i] = D[i];
+        for (int32 i = 0; i < LATENT_DIM; i++) OutZ[i] = D[FEATURE_DIM + i];
+
+        return true;
+    }
+    catch (...) { return false; }
+#else
+    return false;
+#endif
+}
+
+bool ULMMDecompressorComponent::RunStepper(const TArray<float>& F, const TArray<float>& Z,
+    TArray<float>& OutDF, TArray<float>& OutDZ)
+{
+#if WITH_ONNX
+    if (!StepperSession || F.Num() != FEATURE_DIM || Z.Num() != LATENT_DIM) return false;
+
+    try
+    {
+        Ort::Session* Session = static_cast<Ort::Session*>(StepperSession);
+        Ort::MemoryInfo Mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+        std::vector<int64_t> FS = { 1, FEATURE_DIM }, ZS = { 1, LATENT_DIM };
+        std::vector<float> FD(F.GetData(), F.GetData() + F.Num());
+        std::vector<float> ZD(Z.GetData(), Z.GetData() + Z.Num());
+
+        Ort::Value FT = Ort::Value::CreateTensor<float>(Mem, FD.data(), FD.size(), FS.data(), FS.size());
+        Ort::Value ZT = Ort::Value::CreateTensor<float>(Mem, ZD.data(), ZD.size(), ZS.data(), ZS.size());
+
+        std::vector<Ort::Value> Ins;
+        Ins.push_back(std::move(FT));
+        Ins.push_back(std::move(ZT));
+
+        const char* InN[] = { "features", "latent_z" };
+        const char* OutN[] = { "delta" };
+
+        auto Out = Session->Run(Ort::RunOptions{ nullptr }, InN, Ins.data(), 2, OutN, 1);
+        float* D = Out[0].GetTensorMutableData<float>();
+
+        OutDF.SetNum(FEATURE_DIM);
+        OutDZ.SetNum(LATENT_DIM);
+        for (int32 i = 0; i < FEATURE_DIM; i++) OutDF[i] = D[i];
+        for (int32 i = 0; i < LATENT_DIM; i++) OutDZ[i] = D[FEATURE_DIM + i];
+
+        return true;
+    }
+    catch (...) { return false; }
+#else
+    return false;
+#endif
+}
+
+bool ULMMDecompressorComponent::RunDecompressor(const TArray<float>& F, const TArray<float>& Z,
+    TArray<float>& OutP)
+{
+#if WITH_ONNX
+    if (!DecompressorSession || F.Num() != FEATURE_DIM || Z.Num() != LATENT_DIM) return false;
+
+    try
+    {
+        Ort::Session* Session = static_cast<Ort::Session*>(DecompressorSession);
+        Ort::MemoryInfo Mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+        std::vector<int64_t> FS = { 1, FEATURE_DIM }, ZS = { 1, LATENT_DIM };
+        std::vector<float> FD(F.GetData(), F.GetData() + F.Num());
+        std::vector<float> ZD(Z.GetData(), Z.GetData() + Z.Num());
+
+        Ort::Value FT = Ort::Value::CreateTensor<float>(Mem, FD.data(), FD.size(), FS.data(), FS.size());
+        Ort::Value ZT = Ort::Value::CreateTensor<float>(Mem, ZD.data(), ZD.size(), ZS.data(), ZS.size());
+
+        std::vector<Ort::Value> Ins;
+        Ins.push_back(std::move(FT));
+        Ins.push_back(std::move(ZT));
+
+        const char* InN[] = { "features", "latent_z" };
+        const char* OutN[] = { "pose" };
+
+        auto Out = Session->Run(Ort::RunOptions{ nullptr }, InN, Ins.data(), 2, OutN, 1);
+        float* D = Out[0].GetTensorMutableData<float>();
+
+        OutP.SetNum(POSE_DIM);
+        for (int32 i = 0; i < POSE_DIM; i++) OutP[i] = D[i];
+
+        return true;
+    }
+    catch (...) { return false; }
+#else
+    return false;
+#endif
+}
+
+// ==================== APPLY ====================
+
+void ULMMDecompressorComponent::ApplyPoseToControlRig()
+{
+    AActor* Owner = GetOwner();
+    if (!Owner) return;
+
+    UControlRigComponent* RigComp = Owner->FindComponentByClass<UControlRigComponent>();
+    if (!RigComp) return;
+
+    UControlRig* Rig = RigComp->GetControlRig();
+    if (!Rig) return;
+
+    TArray<double> PoseDouble;
+    PoseDouble.SetNum(CurrentPose.Num());
+    for (int32 i = 0; i < CurrentPose.Num(); i++)
+    {
+        PoseDouble[i] = static_cast<double>(CurrentPose[i]);
+    }
+
+    Rig->SetPublicVariableValue(ControlRigVariableName, PoseDouble);
+}
