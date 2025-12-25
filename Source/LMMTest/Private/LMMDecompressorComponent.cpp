@@ -97,6 +97,22 @@ bool ULMMDecompressorComponent::Initialize()
     UE_LOG(LogTemp, Warning, TEXT("[LMM] ✅ Normalization: feat=%d/%d, pose=%d/%d"),
         FeatureMean.Num(), FeatureStd.Num(), PoseMean.Num(), PoseStd.Num());
 
+    // Логируем первые значения mean/std для проверки
+    if (FeatureMean.Num() >= 3 && FeatureStd.Num() >= 3)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] FeatureMean[0-2]: %.4f, %.4f, %.4f"),
+            FeatureMean[0], FeatureMean[1], FeatureMean[2]);
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] FeatureStd[0-2]: %.4f, %.4f, %.4f"),
+            FeatureStd[0], FeatureStd[1], FeatureStd[2]);
+    }
+    if (PoseMean.Num() >= 3 && PoseStd.Num() >= 3)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] PoseMean[0-2]: %.4f, %.4f, %.4f"),
+            PoseMean[0], PoseMean[1], PoseMean[2]);
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] PoseStd[0-2]: %.4f, %.4f, %.4f"),
+            PoseStd[0], PoseStd[1], PoseStd[2]);
+    }
+
     // Инициализируем ONNX
 #if WITH_ONNX
     if (!InitOnnxRuntime())
@@ -339,13 +355,21 @@ void ULMMDecompressorComponent::TickComponent(float DeltaTime, ELevelTick TickTy
         return;
     }
 
-    // С ONNX
-    if (FrameCounter >= ProjectionInterval)
-    {
-        FrameCounter = 0;
+    // С ONNX - ТЕСТОВЫЙ РЕЖИМ: только Projector + Decompressor
+    static int32 DebugCounter = 0;
+    DebugCounter++;
+    bool bLogThisFrame = (DebugCounter <= 5) || (DebugCounter % 60 == 0);
 
+    // Каждый кадр вызываем Projector (без Stepper)
+    {
         TArray<float> Query = BuildQueryFeatures();
         TArray<float> NormQuery = NormalizeFeatures(Query);
+
+        if (bLogThisFrame && NormQuery.Num() >= 4)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[LMM] Frame#%d Query[0-3]: %.4f, %.4f, %.4f, %.4f"),
+                DebugCounter, NormQuery[0], NormQuery[1], NormQuery[2], NormQuery[3]);
+        }
 
         TArray<float> NewF, NewZ;
         if (RunProjector(NormQuery, NewF, NewZ))
@@ -354,20 +378,20 @@ void ULMMDecompressorComponent::TickComponent(float DeltaTime, ELevelTick TickTy
             CurrentLatentZ = NewZ;
         }
     }
-    else
-    {
-        TArray<float> DF, DZ;
-        if (RunStepper(CurrentFeatures, CurrentLatentZ, DF, DZ))
-        {
-            for (int32 i = 0; i < FEATURE_DIM; i++) CurrentFeatures[i] += DF[i];
-            for (int32 i = 0; i < LATENT_DIM; i++) CurrentLatentZ[i] += DZ[i];
-        }
-    }
 
     TArray<float> NormPose;
     if (RunDecompressor(CurrentFeatures, CurrentLatentZ, NormPose))
     {
         CurrentPose = DenormalizePose(NormPose);
+
+        if (bLogThisFrame && CurrentPose.Num() >= 6)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[LMM] Frame#%d POSE[0-5]: %.2f, %.2f, %.2f, %.2f, %.2f, %.2f"),
+                DebugCounter, CurrentPose[0], CurrentPose[1], CurrentPose[2],
+                CurrentPose[3], CurrentPose[4], CurrentPose[5]);
+        }
+
+        // Включаем Control Rig!
         ApplyPoseToControlRig();
     }
 }
@@ -390,15 +414,35 @@ TArray<float> ULMMDecompressorComponent::BuildQueryFeatures()
     TArray<float> Q;
     Q.SetNum(FEATURE_DIM);
 
-    for (int32 i = 0; i < 8 && i < CurrentFeatures.Num(); i++) Q[i] = CurrentFeatures[i];
+    // Позиции ног - пока используем mean значения (нейтральная поза)
+    // Индексы 0-7: позиции левой и правой ноги
+    for (int32 i = 0; i < 8; i++)
+    {
+        Q[i] = (i < FeatureMean.Num()) ? FeatureMean[i] : 0.0f;
+    }
 
-    float VX = DesiredVelocity.Y / 100.0f;
-    float VZ = DesiredVelocity.X / 100.0f;
-    Q[8] = VX; Q[9] = VZ;
+    // Скорость бедра (в метрах/сек, конвертируем из UE координат)
+    // UE: X=forward, Y=right, Z=up (cm/s)
+    // LMM: X=right, Z=forward (m/s)
+    float VX = DesiredVelocity.Y / 100.0f;  // right
+    float VZ = DesiredVelocity.X / 100.0f;  // forward
+    Q[8] = VX;
+    Q[9] = VZ;
 
-    float T[] = { 0.66f, 1.33f, 2.0f };
-    for (int32 i = 0; i < 3; i++) { Q[10 + i * 2] = VX * T[i]; Q[11 + i * 2] = VZ * T[i]; }
-    for (int32 i = 0; i < 3; i++) { Q[16 + i * 2] = DesiredFacing.Y; Q[17 + i * 2] = DesiredFacing.X; }
+    // Траектория (позиции в будущем)
+    float T[] = { 0.33f, 0.66f, 1.0f };  // времена в секундах
+    for (int32 i = 0; i < 3; i++)
+    {
+        Q[10 + i * 2] = VX * T[i];
+        Q[11 + i * 2] = VZ * T[i];
+    }
+
+    // Направление взгляда
+    for (int32 i = 0; i < 3; i++)
+    {
+        Q[16 + i * 2] = DesiredFacing.Y;  // right component
+        Q[17 + i * 2] = DesiredFacing.X;  // forward component
+    }
 
     return Q;
 }
@@ -549,21 +593,15 @@ bool ULMMDecompressorComponent::RunDecompressor(const TArray<float>& F, const TA
 
 void ULMMDecompressorComponent::ApplyPoseToControlRig()
 {
-    AActor* Owner = GetOwner();
-    if (!Owner) return;
+    // Пока просто логируем что поза готова
+    // Control Rig настроим позже
 
-    UControlRigComponent* RigComp = Owner->FindComponentByClass<UControlRigComponent>();
-    if (!RigComp) return;
+    static int32 ApplyCounter = 0;
+    ApplyCounter++;
 
-    UControlRig* Rig = RigComp->GetControlRig();
-    if (!Rig) return;
-
-    TArray<double> PoseDouble;
-    PoseDouble.SetNum(CurrentPose.Num());
-    for (int32 i = 0; i < CurrentPose.Num(); i++)
+    if (ApplyCounter % 120 == 0)
     {
-        PoseDouble[i] = static_cast<double>(CurrentPose[i]);
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] ApplyPose #%d - Pose ready (%.1f, %.1f, %.1f ...)"),
+            ApplyCounter, CurrentPose[0], CurrentPose[1], CurrentPose[2]);
     }
-
-    Rig->SetPublicVariableValue(ControlRigVariableName, PoseDouble);
 }
