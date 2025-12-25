@@ -50,6 +50,24 @@ void ULMMDecompressorComponent::BeginPlay()
     {
         bIsInitialized = true;
         UE_LOG(LogTemp, Warning, TEXT("[LMM] ✅ Initialization SUCCESS!"));
+
+        // Выводим имена костей для отладки
+        AActor* Owner = GetOwner();
+        if (Owner)
+        {
+            USkeletalMeshComponent* SkelMesh = Owner->FindComponentByClass<USkeletalMeshComponent>();
+            if (SkelMesh && SkelMesh->GetSkeletalMeshAsset())
+            {
+                const FReferenceSkeleton& RefSkel = SkelMesh->GetSkeletalMeshAsset()->GetRefSkeleton();
+                int32 NumBones = RefSkel.GetNum();
+                UE_LOG(LogTemp, Warning, TEXT("[LMM] Skeleton has %d bones:"), NumBones);
+                for (int32 i = 0; i < NumBones; i++)
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("[LMM]   Bone %d: %s"), i, *RefSkel.GetBoneName(i).ToString());
+                }
+            }
+        }
+
         ForceProjection();
     }
     else
@@ -593,15 +611,15 @@ bool ULMMDecompressorComponent::RunDecompressor(const TArray<float>& F, const TA
 
 void ULMMDecompressorComponent::ApplyPoseToControlRig()
 {
-    // Пока просто логируем что поза готова
-    // Control Rig настроим позже
-
     static int32 ApplyCounter = 0;
     ApplyCounter++;
 
+    // Логируем позу иногда
     if (ApplyCounter % 120 == 0)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[LMM] ApplyPose #%d - Pose ready (%.1f, %.1f, %.1f ...)"),
+        UE_LOG(LogTemp, Warning, TEXT("[LMM] ApplyPose #%d - Hips: (%.1f, %.1f, %.1f)"),
             ApplyCounter, CurrentPose[0], CurrentPose[1], CurrentPose[2]);
     }
+
+    // TODO: Применение позы через Control Rig или Animation Blueprint
 }
