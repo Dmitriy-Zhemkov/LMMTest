@@ -16,18 +16,34 @@ public class LMMTest : ModuleRules
             "Engine", 
             "InputCore", 
             "EnhancedInput", 
-            "ControlRig", 
-            "AnimGraphRuntime", 
+            "ControlRig",  
             "RigVM"
         });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 
-        PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "../ThirdParty/onnxruntime/include"));
-        PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "../ThirdParty/onnxruntime/lib/onnxruntime.lib"));
-        RuntimeDependencies.Add("$(TargetOutputDir)/onnxruntime.dll", Path.Combine(ModuleDirectory, "../ThirdParty/onnxruntime/lib/onnxruntime.dll"));
+        // ONNX Runtime
+        string OnnxPath = Path.Combine(ModuleDirectory, "../ThirdParty/onnxruntime");
 
-        //PublicSystemLibraries.Add("msvcp140.lib");
+        if (Directory.Exists(OnnxPath))
+        {
+            PublicIncludePaths.Add(Path.Combine(OnnxPath, "include"));
+            PublicAdditionalLibraries.Add(Path.Combine(OnnxPath, "lib/onnxruntime.lib"));
+
+            // Копируем DLL
+            string DllPath = Path.Combine(OnnxPath, "lib/onnxruntime.dll");
+            if (File.Exists(DllPath))
+            {
+                RuntimeDependencies.Add("$(BinaryOutputDir)/onnxruntime.dll", DllPath);
+                PublicDelayLoadDLLs.Add("onnxruntime.dll");
+            }
+
+            PublicDefinitions.Add("WITH_ONNX=1");
+        }
+        else
+        {
+            PublicDefinitions.Add("WITH_ONNX=0");
+        }
         bUseRTTI = true;
         bEnableExceptions = true;
     }
